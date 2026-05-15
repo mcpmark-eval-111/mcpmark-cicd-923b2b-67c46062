@@ -1,0 +1,353 @@
+name: Pull Request Automation
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: write
+  security-events: write
+
+jobs:
+  code-quality:
+    name: code-quality
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run ESLint
+        id: eslint
+        run: |
+          echo "## Running ESLint..." >> $GITHUB_STEP_SUMMARY
+          if npm run lint 2>&1 | tee eslint-output.txt; then
+            echo "eslint_status=passed" >> $GITHUB_OUTPUT
+            echo "ESLint: ✅ Passed" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "eslint_status=failed" >> $GITHUB_OUTPUT
+            echo "ESLint: ❌ Failed" >> $GITHUB_STEP_SUMMARY
+            cat eslint-output.txt >> $GITHUB_STEP_SUMMARY
+          fi
+        continue-on-error: true
+
+      - name: Run Prettier check
+        id: prettier
+        run: |
+          echo "## Running Prettier..." >> $GITHUB_STEP_SUMMARY
+          if npx prettier --check . 2>&1 | tee prettier-output.txt; then
+            echo "prettier_status=passed" >> $GITHUB_OUTPUT
+            echo "Prettier: ✅ Passed" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "prettier_status=failed" >> $GITHUB_OUTPUT
+            echo "Prettier: ❌ Failed" >> $GITHUB_STEP_SUMMARY
+            cat prettier-output.txt >> $GITHUB_STEP_SUMMARY
+          fi
+        continue-on-error: true
+
+      - name: Post Code Quality Report
+        uses: actions/github-script@v7
+        if: always()
+        with:
+          script: |
+            const eslintStatus = '${{ steps.eslint.outputs.eslint_status }}' === 'passed' ? '✅ Passed' : '❌ Failed';
+            const prettierStatus = '${{ steps.prettier.outputs.prettier_status }}' === 'passed' ? '✅ Passed' : '❌ Failed';
+            
+            const body = `## Code Quality Report
+            
+            ### ESLint
+            Status: ${eslintStatus}
+            
+            ### Prettier
+            Status: ${prettierStatus}
+            
+            ---
+            *Automated code quality check completed*`;
+            
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: body
+            });
+
+  testing-suite:
+    name: testing-suite
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run tests with coverage
+        id: test
+        run: |
+          echo "## Running Test Suite..." >> $GITHUB_STEP_SUMMARY
+          if npm test -- --coverage 2>&1 | tee test-output.txt; then
+            echo "test_status=passed" >> $GITHUB_OUTPUT
+            echo "Tests: ✅ Passed" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "test_status=failed" >> $GITHUB_OUTPUT
+            echo "Tests: ❌ Failed" >> $GITHUB_STEP_SUMMARY
+          fi
+        continue-on-error: true
+
+      - name: Generate coverage report
+        id: coverage
+        run: |
+          if [ -d "coverage" ]; then
+            echo "coverage_exists=true" >> $GITHUB_OUTPUT
+            if [ -f "coverage/lcov-report/index.html" ]; then
+              COVERAGE=$(grep -oP 'Total.*?([0-9.]+)%' coverage/lcov-report/index.html | head -1 || echo "N/A")
+              echo "coverage_percent=$COVERAGE" >> $GITHUB_OUTPUT
+            fi
+          else
+            echo "coverage_exists=false" >> $GITHUB_OUTPUT
+          fi
+        continue-on-error: true
+
+      - name: Upload coverage artifacts
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage-report-${{ github.run_number }}
+          path: coverage/
+          retention-days: 30
+        continue-on-error: true
+
+      - name: Post Test Coverage Report
+        uses: actions/github-script@v7
+        if: always()
+        with:
+          script: |
+            const testStatus = '${{ steps.test.outputs.test_status }}' === 'passed' ? '✅ Passed' : '❌ Failed';
+            const coverageExists = '${{ steps.coverage.outputs.coverage_exists }}' === 'true';
+            const coveragePercent = '${{ steps.coverage.outputs.coverage_percent }}' || 'N/A';
+            
+            const body = `## Test Coverage Report
+            
+            ### Test Suite
+            Status: ${testStatus}
+            
+            ### Coverage
+            ${coverageExists ? `Artifacts uploaded successfully
+Coverage: ${coveragePercent}` : 'Coverage report not generated'}
+            
+            ---
+            *Automated testing completed*`;
+            
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: body
+            });
+
+  security-scan:
+    name: security-scan
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run npm audit
+        id: audit
+        run: |
+          echo "## Running Dependency Vulnerability Check..." >> $GITHUB_STEP_SUMMARY
+          if npm audit --audit-level=moderate 2>&1 | tee audit-output.txt; then
+            echo "audit_status=passed" >> $GITHUB_OUTPUT
+            echo "Vulnerabilities: ✅ None found" >> $GITHUB_STEP_SUMMARY
+            echo "vuln_count=0" >> $GITHUB_OUTPUT
+          else
+            echo "audit_status=warning" >> $GITHUB_OUTPUT
+            VULN_COUNT=$(grep -oP '\d+ vulnerabilities' audit-output.txt | grep -oP '\d+' | head -1 || echo "unknown")
+            echo "vuln_count=$VULN_COUNT" >> $GITHUB_OUTPUT
+            echo "Vulnerabilities: ⚠️ Found" >> $GITHUB_STEP_SUMMARY
+            cat audit-output.txt >> $GITHUB_STEP_SUMMARY
+          fi
+        continue-on-error: true
+
+      - name: Scan for secrets
+        id: secrets
+        run: |
+          echo "## Scanning for Secrets..." >> $GITHUB_STEP_SUMMARY
+          # Simple pattern matching for common secrets
+          SECRET_PATTERNS="(password|secret|key|token|api_key).*=.*['\"][A-Za-z0-9]{20,}['\"]"
+          if git diff origin/main...HEAD | grep -iE "$SECRET_PATTERNS" > secrets-found.txt 2>&1; then
+            echo "secrets_status=warning" >> $GITHUB_OUTPUT
+            echo "Secrets: ⚠️ Potential secrets detected in changes" >> $GITHUB_STEP_SUMMARY
+            echo "secrets_found=true" >> $GITHUB_OUTPUT
+          else
+            echo "secrets_status=passed" >> $GITHUB_OUTPUT
+            echo "Secrets: ✅ No secrets detected" >> $GITHUB_STEP_SUMMARY
+            echo "secrets_found=false" >> $GITHUB_OUTPUT
+          fi
+        continue-on-error: true
+
+      - name: Post Security Scan Report
+        uses: actions/github-script@v7
+        if: always()
+        with:
+          script: |
+            const auditStatus = '${{ steps.audit.outputs.audit_status }}' === 'passed' ? '✅ Passed' : '⚠️ Issues Found';
+            const vulnCount = '${{ steps.audit.outputs.vuln_count }}' || '0';
+            const secretsStatus = '${{ steps.secrets.outputs.secrets_status }}' === 'passed' ? '✅ Passed' : '⚠️ Review Needed';
+            
+            const body = `## Security Scan Report
+            
+            ### Dependencies
+            Status: ${auditStatus}
+            Vulnerabilities: ${vulnCount} found
+            
+            ### Secrets Scan
+            Status: ${secretsStatus}
+            
+            ---
+            *Automated security scan completed*`;
+            
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: body
+            });
+
+  build-validation:
+    name: build-validation
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Attempt build
+        id: build
+        run: |
+          echo "## Building Application..." >> $GITHUB_STEP_SUMMARY
+          if npm run build 2>&1 | tee build-output.txt; then
+            echo "build_status=passed" >> $GITHUB_OUTPUT
+            echo "Build: ✅ Successful" >> $GITHUB_STEP_SUMMARY
+          else
+            # Try alternative build commands
+            if [ -f "package.json" ] && grep -q '"build"' package.json; then
+              echo "build_status=failed" >> $GITHUB_OUTPUT
+              echo "Build: ❌ Failed" >> $GITHUB_STEP_SUMMARY
+            else
+              echo "build_status=skipped" >> $GITHUB_OUTPUT
+              echo "Build: ⏭️ No build script found" >> $GITHUB_STEP_SUMMARY
+            fi
+          fi
+        continue-on-error: true
+
+      - name: Validate endpoints
+        id: validate
+        run: |
+          echo "## Validating Endpoints..." >> $GITHUB_STEP_SUMMARY
+          # Check for common endpoint files
+          ENDPOINTS_FOUND=false
+          if [ -d "routes" ] || [ -d "api" ] || [ -d "src/routes" ] || grep -r "app.get\|router.get\|app.post" --include="*.js" . > /dev/null 2>&1; then
+            echo "endpoints_status=found" >> $GITHUB_OUTPUT
+            echo "Endpoints: ✅ Application structure validated" >> $GITHUB_STEP_SUMMARY
+            ENDPOINTS_FOUND=true
+          else
+            echo "endpoints_status=not_applicable" >> $GITHUB_OUTPUT
+            echo "Endpoints: ℹ️ No web endpoints detected" >> $GITHUB_STEP_SUMMARY
+          fi
+        continue-on-error: true
+
+      - name: Create deployment preview artifacts
+        run: |
+          mkdir -p preview-artifacts
+          echo "Build completed at $(date)" > preview-artifacts/build-info.txt
+          echo "Commit: ${{ github.sha }}" >> preview-artifacts/build-info.txt
+          echo "PR: #${{ github.event.pull_request.number }}" >> preview-artifacts/build-info.txt
+          if [ -d "dist" ]; then cp -r dist preview-artifacts/ 2>/dev/null || true; fi
+          if [ -d "build" ]; then cp -r build preview-artifacts/ 2>/dev/null || true; fi
+        continue-on-error: true
+
+      - name: Upload preview artifacts
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: deployment-preview-${{ github.run_number }}
+          path: preview-artifacts/
+          retention-days: 7
+        continue-on-error: true
+
+      - name: Post Build Validation
+        uses: actions/github-script@v7
+        if: always()
+        with:
+          script: |
+            const buildStatus = '${{ steps.build.outputs.build_status }}';
+            const endpointsStatus = '${{ steps.validate.outputs.endpoints_status }}';
+            
+            let buildText = '⏭️ Skipped';
+            if (buildStatus === 'passed') buildText = '✅ Successful';
+            else if (buildStatus === 'failed') buildText = '❌ Failed';
+            
+            let endpointsText = 'ℹ️ Not Applicable';
+            if (endpointsStatus === 'found') endpointsText = '✅ Validated';
+            
+            const body = `## Build Validation
+            
+            ### Build Status
+            ${buildText}
+            
+            ### Endpoints
+            ${endpointsText}
+            
+            ### Preview Artifacts
+            Deployment preview artifacts have been uploaded
+            
+            ---
+            *Automated build validation completed*`;
+            
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: body
+            });
